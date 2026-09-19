@@ -1,7 +1,7 @@
 // Command layad serves Laya typed decisions over HTTP (GoFiber + ONNX Runtime).
 //
-//	POST /v1/predict          {"context": <any JSON>, "spec": {<qid>: {...}}, "model"?, "lang"?, "task"?}
-//	POST /v1/presets/:name    {"context": <any JSON>, "model"?, "lang"?, "categories"? (email only)}
+//	POST /v1/predict          {"context": <any JSON>, "spec": {<qid>: {...}}, "model"?, "lang"?, "task"?, "max_len"?}
+//	POST /v1/presets/:name    {"context": <any JSON>, "model"?, "lang"?, "categories"? (email only), "max_len"?}
 //	POST /v1/route            {"context": ..., "spec"?, "model"?, "lang"?, "task"?}  -> routing decision only
 //	GET  /v1/presets          list presets;  GET /v1/presets/:name -> the preset's spec
 //	GET  /v1/models           available / loaded checkpoints
@@ -20,6 +20,8 @@
 //	-coreml          LAYA_COREML            macOS: enable the CoreML execution provider (default false)
 //	-ort             ONNXRUNTIME_SHARED_LIBRARY_PATH  path to libonnxruntime.{so,dylib}
 //	-body-limit      LAYA_BODY_LIMIT        max request body in bytes (default 4 MiB)
+//	-max-len         LAYA_MAX_LEN           context window in tokens for every checkpoint, e.g. 2048 or 4096
+//	                                        (default 0 = each checkpoint's own max_len: 512 / 1024; max 8192)
 package main
 
 import (
@@ -82,7 +84,12 @@ func main() {
 	coreml := flag.Bool("coreml", envBool("LAYA_COREML", false), "enable the CoreML execution provider (macOS)")
 	ortLib := flag.String("ort", os.Getenv("ONNXRUNTIME_SHARED_LIBRARY_PATH"), "path to the onnxruntime shared library")
 	bodyLimit := flag.Int("body-limit", envInt("LAYA_BODY_LIMIT", 4<<20), "max request body size in bytes")
+	maxLen := flag.Int("max-len", envInt("LAYA_MAX_LEN", 0), "context window in tokens for every checkpoint, e.g. 2048 or 4096 (0 = checkpoint default, max 8192)")
 	flag.Parse()
+
+	if *maxLen < 0 || *maxLen > laya.MaxContext {
+		log.Fatalf("-max-len %d: must be between 0 (checkpoint default) and %d", *maxLen, laya.MaxContext)
+	}
 
 	if err := laya.InitRuntime(*ortLib); err != nil {
 		log.Fatalf("onnxruntime: %v (set -ort / ONNXRUNTIME_SHARED_LIBRARY_PATH to libonnxruntime)", err)
@@ -93,7 +100,7 @@ func main() {
 		Default:           *defModel,
 		MaxLoaded:         *maxLoaded,
 		AutoTaskDetection: *autoTask,
-		Load:              laya.Options{IntraOpThreads: *threads, CoreML: *coreml, ModelFile: *modelFile},
+		Load:              laya.Options{IntraOpThreads: *threads, CoreML: *coreml, ModelFile: *modelFile, MaxLen: *maxLen},
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -105,6 +112,9 @@ func main() {
 		log.Fatalf("no exported checkpoints under %s (run: python export/export_onnx.py all)", *modelsDir)
 	}
 	log.Printf("laya: %d CPUs, onnxruntime %s, checkpoints available: %s", runtime.NumCPU(), ortVersion(), strings.Join(avail, ", "))
+	if *maxLen > 0 {
+		log.Printf("laya: context window overridden to %d tokens for every checkpoint (-max-len)", *maxLen)
+	}
 
 	var ready atomic.Bool
 	var names []string
@@ -135,7 +145,7 @@ func main() {
 		ready.Store(true)
 	}()
 
-	app := newApp(router, &ready, *bodyLimit)
+	app := newApp(router, &ready, *bodyLimit, *maxLen)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -145,8 +155,8 @@ func main() {
 	}
 }
 
-// newApp wires the HTTP routes onto a Fiber app.
-func newApp(router *laya.Router, ready *atomic.Bool, bodyLimit int) *fiber.App {
+// newApp wires the HTTP routes onto a Fiber app. maxLen is the -max-len override (0 = none).
+func newApp(router *laya.Router, ready *atomic.Bool, bodyLimit int, maxLen int) *fiber.App {
 	app := fiber.New(fiber.Config{
 		AppName:      "layad",
 		BodyLimit:    bodyLimit,
@@ -157,7 +167,7 @@ func newApp(router *laya.Router, ready *atomic.Bool, bodyLimit int) *fiber.App {
 	app.Use(fiberrecover.New())
 	app.Use(logger.New(logger.Config{Format: "${time} ${status} ${method} ${path} ${latency}\n"}))
 
-	s := &server{router: router, ready: ready}
+	s := &server{router: router, ready: ready, maxLen: maxLen}
 	app.Get("/healthz", func(c fiber.Ctx) error { return c.JSON(fiber.Map{"status": "ok"}) })
 	app.Get("/readyz", func(c fiber.Ctx) error {
 		if !ready.Load() {
@@ -185,6 +195,7 @@ func ortVersion() string {
 type server struct {
 	router *laya.Router
 	ready  *atomic.Bool
+	maxLen int // -max-len override (0 = checkpoint default), reported by /v1/models
 }
 
 type apiError struct {
@@ -259,8 +270,17 @@ func parseRequest(c fiber.Ctx) (*request, error) {
 			case "task":
 				r.Route.Task = f.Val.Str
 			}
+		case "max_len":
+			if f.Val.Kind == laya.KindNull {
+				continue
+			}
+			n, convErr := strconv.Atoi(f.Val.Num)
+			if f.Val.Kind != laya.KindNumber || convErr != nil || n < 0 || n > laya.MaxContext {
+				return nil, badRequest("field \"max_len\" must be an integer between 1 and %d (tokens), e.g. 2048 or 4096", laya.MaxContext)
+			}
+			r.Route.MaxLen = n
 		default:
-			return nil, badRequest("unknown field %q (expected context, spec, model, lang, task; state/questions/categories are also accepted)", f.Key)
+			return nil, badRequest("unknown field %q (expected context, spec, model, lang, task, max_len; state/questions/categories are also accepted)", f.Key)
 		}
 	}
 	if !haveCtx {
@@ -290,7 +310,7 @@ func (s *server) predict(c fiber.Ctx) error {
 
 func predictError(err error) error {
 	msg := err.Error()
-	if strings.Contains(msg, "unknown model") || strings.Contains(msg, "exceed head_max_len") {
+	if strings.Contains(msg, "unknown model") || strings.Contains(msg, "exceed head_max_len") || strings.Contains(msg, "max_len") {
 		return badRequest("%s", msg)
 	}
 	if strings.Contains(msg, "load ") {
@@ -334,6 +354,9 @@ func (s *server) models(c fiber.Ctx) error {
 		i := info{Name: n, Loaded: loaded[n]}
 		if cfg, err := laya.LoadConfig(s.router.Dir(n)); err == nil {
 			i.Repo, i.Encoder, i.MaxLen = cfg.Repo, cfg.Encoder, cfg.MaxLen
+			if s.maxLen > 0 {
+				i.MaxLen = s.maxLen
+			}
 		}
 		out = append(out, i)
 	}

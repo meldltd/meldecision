@@ -15,6 +15,9 @@ import (
 //	multilingual     mmBERT-base, 1024 tokens              100+ languages
 //	typed-decisions  ModernBERT-large, 1024 tokens         the four typed-decisions workflows
 //
+// The token counts are the checkpoints' defaults; Options.MaxLen / RouteRequest.MaxLen raise
+// them (up to MaxContext = 8192).
+//
 // Script detection is the primary signal: the English checkpoint collapses to near-random on
 // non-Latin scripts while still reporting high confidence.
 
@@ -99,6 +102,9 @@ type RouteRequest struct {
 	Model string // explicit checkpoint (name or alias)
 	Task  string // "typed_decisions" (or a model name) selects a checkpoint by task
 	Lang  string // BCP-47-ish language code; "en" routes to english, anything else to multilingual
+	// MaxLen is a per-request context window in tokens (e.g. 2048 or 4096); 0 uses the
+	// checkpoint's configured max_len (or the load-time Options.MaxLen override).
+	MaxLen int
 }
 
 // RouterOptions configure a Router.
@@ -353,7 +359,7 @@ func (r *Router) Predict(state Value, spec Spec, req RouteRequest) (*Result, err
 		return nil, err
 	}
 	defer release()
-	res, err := agent.predictLocked(state, spec)
+	res, err := agent.predictLocked(state, spec, req.MaxLen)
 	if err != nil {
 		return nil, err
 	}

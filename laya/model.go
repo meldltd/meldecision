@@ -22,6 +22,11 @@ type Options struct {
 	// ModelFile overrides the graph file name inside the checkpoint directory
 	// (e.g. "model.int8.onnx" for the dynamically quantised variant).
 	ModelFile string
+	// MaxLen overrides the checkpoint's max_len (context window in tokens) for every
+	// request, e.g. 2048 or 4096. 0 keeps the value from laya_config.json (512/1024).
+	// Must be at most MaxContext. Longer contexts cost more memory and time per request
+	// and were not part of fine-tuning, so probabilities may be slightly less calibrated.
+	MaxLen int
 }
 
 var (
@@ -65,6 +70,10 @@ func Load(dir string, opt Options) (*Agent, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := cfg.CheckMaxLen(opt.MaxLen); err != nil {
+		return nil, fmt.Errorf("%s: %w", dir, err)
+	}
+	cfg = cfg.withMaxLen(opt.MaxLen)
 	tok, err := LoadTokenizer(dir)
 	if err != nil {
 		return nil, err
@@ -147,21 +156,31 @@ type Timing struct {
 // Predict evaluates every question in spec over state in one forward pass.
 // It holds the agent's read lock for the whole call, so Close waits for it.
 func (a *Agent) Predict(state Value, spec Spec) (*Result, error) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	return a.predictLocked(state, spec)
+	return a.PredictMaxLen(state, spec, 0)
 }
 
-// predictLocked is Predict for callers that already hold a.mu.RLock (the Router).
-func (a *Agent) predictLocked(state Value, spec Spec) (*Result, error) {
+// PredictMaxLen is Predict with a per-call context window: maxLen tokens (e.g. 2048 or
+// 4096) instead of the agent's configured max_len; 0 uses the configured value.
+func (a *Agent) PredictMaxLen(state Value, spec Spec, maxLen int) (*Result, error) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.predictLocked(state, spec, maxLen)
+}
+
+// predictLocked is PredictMaxLen for callers that already hold a.mu.RLock (the Router).
+func (a *Agent) predictLocked(state Value, spec Spec, maxLen int) (*Result, error) {
 	if a.closed {
 		return nil, fmt.Errorf("agent is closed")
 	}
+	if err := a.Config.CheckMaxLen(maxLen); err != nil {
+		return nil, err
+	}
+	cfg := a.Config.withMaxLen(maxLen)
 	t0 := time.Now()
 	stateText := SerializeState(state)
 	seqs := make([]Sequence, len(spec))
 	for i := range spec {
-		s, err := BuildSequence(a.tok, a.Config, stateText, &spec[i])
+		s, err := BuildSequence(a.tok, cfg, stateText, &spec[i])
 		if err != nil {
 			return nil, err
 		}

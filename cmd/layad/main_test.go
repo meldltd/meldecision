@@ -18,7 +18,7 @@ func TestValidationAndRouting(t *testing.T) {
 		t.Fatal(err)
 	}
 	var ready atomic.Bool
-	app := newApp(r, &ready, 1<<20)
+	app := newApp(r, &ready, 1<<20, 0)
 
 	do := func(method, path, body string) (int, map[string]any) {
 		req := httptest.NewRequest(method, path, strings.NewReader(body))
@@ -60,6 +60,19 @@ func TestValidationAndRouting(t *testing.T) {
 	}
 	if code, out := do("POST", "/v1/predict", `{"context": "x", "spec": {"q": {"type": "noul", "instructions": "?"}}, "model": "nope"}`); code != 400 || !strings.Contains(out["error"].(string), "unknown model") {
 		t.Errorf("unknown model: %d %v", code, out)
+	}
+	if code, out := do("POST", "/v1/predict", `{"context": "x", "spec": {}, "max_len": "big"}`); code != 400 || !strings.Contains(out["error"].(string), "max_len") {
+		t.Errorf("non-numeric max_len: %d %v", code, out)
+	}
+	if code, out := do("POST", "/v1/predict", `{"context": "x", "spec": {}, "max_len": 16384}`); code != 400 || !strings.Contains(out["error"].(string), "max_len") {
+		t.Errorf("max_len above the encoder limit: %d %v", code, out)
+	}
+	if code, out := do("POST", "/v1/predict", `{"context": "x", "spec": {}, "max_len": 2.5}`); code != 400 || !strings.Contains(out["error"].(string), "max_len") {
+		t.Errorf("fractional max_len: %d %v", code, out)
+	}
+	// a valid max_len passes validation; with no checkpoint on disk it then fails to load -> 503
+	if code, _ := do("POST", "/v1/predict", `{"context": "x", "spec": {"q": {"type": "noul", "instructions": "?"}}, "max_len": 4096}`); code != 503 {
+		t.Errorf("valid max_len should reach model loading (503), got %d", code)
 	}
 	// no checkpoint on disk -> 503, not 500
 	if code, _ := do("POST", "/v1/predict", `{"context": "x", "spec": {"q": {"type": "noul", "instructions": "?"}}}`); code != 503 {

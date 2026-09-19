@@ -19,6 +19,11 @@ package (script / language detection → `english`, `multilingual` or `typed-dec
 The Go port is verified against the Python reference: token sequences are byte-identical and
 answers agree to 4 decimals on the golden fixtures in `testdata/` (`make test`).
 
+The context column is each checkpoint's default. Both encoders are pre-trained with RoPE up to
+8192 positions and the ONNX graph has a dynamic sequence axis, so the window can be raised to
+2048 or 4096 tokens with `-max-len` (all requests) or `"max_len"` (one request) — see
+[Longer contexts](#longer-contexts).
+
 ## Layout
 
 ```
@@ -96,6 +101,32 @@ least-recently-used one is evicted.
 | `-model-file` | `LAYA_MODEL_FILE` | `model.onnx` | e.g. `model.int8.onnx` |
 | `-coreml` | `LAYA_COREML` | `false` | macOS CoreML execution provider (experimental) |
 | `-ort` | `ONNXRUNTIME_SHARED_LIBRARY_PATH` | | path to `libonnxruntime.{so,dylib}` |
+| `-max-len` | `LAYA_MAX_LEN` | checkpoint default | context window in tokens for every checkpoint (e.g. `2048`, `4096`; max 8192) |
+| `-body-limit` | `LAYA_BODY_LIMIT` | 4 MiB | max request body size in bytes |
+
+### Longer contexts
+
+Each checkpoint truncates the serialised context to its `max_len` (512 tokens for `english`,
+1024 for the other two); anything beyond that is silently dropped. To keep more of a long
+document or email thread:
+
+```bash
+./bin/layad -max-len 4096                 # every checkpoint, every request
+LAYA_MAX_LEN=2048 ./bin/layad             # same, via the environment
+```
+
+or per request, which takes precedence over the server setting:
+
+```json
+{"context": {...}, "spec": {...}, "max_len": 2048}
+```
+
+`/v1/models` reports the effective `max_len`. Values are validated (1 … 8192, and at least
+`head_max_len + 16`); out-of-range values are a 400. Two things to keep in mind: inference cost
+grows with the sequence (roughly linearly for the sliding-window layers, quadratically for the
+global-attention layers, so 4096 tokens needs a few GB of working memory per request), and the
+checkpoints were fine-tuned at their default lengths, so very long contexts run correctly but
+the calibration of the probabilities was not verified there.
 
 Docker (Linux): `docker build -t layad . && docker run -p 8080:8080 -v $PWD/models:/models:ro layad`.
 

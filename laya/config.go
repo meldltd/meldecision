@@ -39,6 +39,40 @@ type SpecialTokens struct {
 	Pad    string `json:"pad"`
 }
 
+// MaxContext is the longest sequence any checkpoint accepts: both encoders (ModernBERT and
+// mmBERT) are pre-trained with RoPE positions up to 8192 tokens and the exported ONNX graph
+// has a dynamic sequence axis, so max_len may be raised up to this value at load time
+// (Options.MaxLen) or per request (RouteRequest.MaxLen). The checkpoints were fine-tuned at
+// 512/1024 tokens, so longer contexts are supported but not calibrated.
+const MaxContext = 8192
+
+// CheckMaxLen validates a max_len override for cfg: 0 means "use the checkpoint default";
+// anything else must leave room for the question head and stay within MaxContext.
+func (c *Config) CheckMaxLen(n int) error {
+	switch {
+	case n == 0:
+		return nil
+	case n < 0:
+		return fmt.Errorf("max_len must be positive, got %d", n)
+	case n > MaxContext:
+		return fmt.Errorf("max_len %d exceeds the encoder limit of %d tokens", n, MaxContext)
+	case n < c.HeadMaxLen+16:
+		return fmt.Errorf("max_len %d is too small for head_max_len=%d (need at least %d)", n, c.HeadMaxLen, c.HeadMaxLen+16)
+	}
+	return nil
+}
+
+// withMaxLen returns c itself when n is 0 or equal to c.MaxLen, otherwise a shallow copy
+// with MaxLen replaced (the slices and maps are shared read-only).
+func (c *Config) withMaxLen(n int) *Config {
+	if n == 0 || n == c.MaxLen {
+		return c
+	}
+	cp := *c
+	cp.MaxLen = n
+	return &cp
+}
+
 // LoadConfig reads <dir>/laya_config.json and fills defaults.
 func LoadConfig(dir string) (*Config, error) {
 	p := filepath.Join(dir, "laya_config.json")
