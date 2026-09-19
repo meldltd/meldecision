@@ -1,0 +1,9 @@
+bin/
+models/
+third_party/
+!third_party/.gitkeep
+*.onnx
+*.onnx.data
+__pycache__/
+.DS_Store
+.venv
